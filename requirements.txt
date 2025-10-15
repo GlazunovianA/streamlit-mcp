@@ -1,0 +1,8 @@
+openai
+asyncio
+mcp
+streamlit
+pandas
+numpy
+matplotlib
+plotly
