@@ -6,3 +6,7 @@ pandas
 numpy
 matplotlib
 plotly
+e2b-code-interpreter
+mimetype
+langgraph
+langchain-core

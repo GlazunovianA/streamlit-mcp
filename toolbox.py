@@ -1,9 +1,11 @@
-import io, sys, textwrap, contextlib, traceback, time, json as _json, re
+import os, io, time, mimetypes, sys, textwrap, contextlib, traceback, time, json, re
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import plotly.express as px
+from dotenv import load_dotenv
+from e2b_code_interpreter import Sandbox
 
 INLINE_JSON_MAX_BYTES = 1_500_000  # ~1.5MB cap for dataframe_json
 
@@ -15,6 +17,27 @@ def _strip_imports(src: str) -> str:
 
 def handle_st_exec(args: dict):
     code = args.get("code", "")
+    load_dotenv()
+    os.environ["E2B_API_KEY"] = args.get("e2b_api_key").replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
+    # -------------- sanity check --------------
+    key = args.get("e2b_api_key") or os.getenv("E2B_API_KEY") or st.secrets.get("E2B_API_KEY")
+    if not key:
+        return {"ok": False, "logs": "", "error": "Missing E2B_API_KEY", "elapsed": 0.0}
+
+    INLINE_JSON_MAX_BYTES = 2_000_000  # ~2MB
+    sbx = Sandbox.create() # By default the sandbox is alive for 5 minutes
+    # ----------- TEST SANDBOX -----------
+    execution = sbx.run_code("print('hello world')") # Execute Python inside the sandbox
+    print(execution.logs)
+
+    execution = sbx.run_code(code)
+    print(execution.logs)
+    # ------------------------------------
+
+
+    files = sbx.files.list("/")
+    print(files)
+    print('------------- execution successful! ------------')
     timeout_s = int(args.get("timeout_s", 5))
 
     # --- Prepare df from (1) dataframe_json -> (2) df_key -> (3) last_df_json
@@ -48,41 +71,102 @@ def handle_st_exec(args: dict):
             except Exception as e:
                 st.warning(f"Failed to load df from last_df_json: {e}")
 
-    # --- Build safe globals/locals
-    allowed_builtins = {
-        "print": print, "len": len, "range": range, "min": min, "max": max, "sum": sum, "abs": abs, "round": round,
-        "enumerate": enumerate, "zip": zip, "map": map, "filter": filter, "any": any, "all": all, "sorted": sorted,
-        "__import__": __import__, "print": print
-    }
-    g = {"__builtins__": allowed_builtins}
-    l = {"st": st, "pd": pd, "np": np, "plt": plt, "px": px, "df": df}
 
-    # --- Sanitize code (remove imports)
-    safe_code = _strip_imports(textwrap.dedent(code))
+    prelude_lines = [
+        "import os, json, pandas as pd",
+        "from pathlib import Path",
+        "ARTIFACTS_DIR = '/artifacts'",
+        "Path(ARTIFACTS_DIR).mkdir(parents=True, exist_ok=True)",
+        "",
+        "def save_text(text, name='output.txt'):",
+        "    p = os.path.join(ARTIFACTS_DIR, name)",
+        "    with open(p, 'w', encoding='utf-8') as f: f.write(text)",
+        "    print(f'[artifact] text:{name}')",
+        "    return p",
+        "",
+        "def save_table(df, name='table.csv'):",
+        "    p = os.path.join(ARTIFACTS_DIR, name)",
+        "    df.to_csv(p, index=False)",
+        "    print(f'[artifact] table:{name}')",
+        "    return p",
+        "",
+        "def save_json(obj, name='data.json'):",
+        "    p = os.path.join(ARTIFACTS_DIR, name)",
+        "    with open(p, 'w', encoding='utf-8') as f: json.dump(obj, f, ensure_ascii=False)",
+        "    print(f'[artifact] json:{name}')",
+        "    return p",
+        "",
+        "def save_fig(fig=None, name='figure.png', dpi=150):",
+        "    import matplotlib.pyplot as plt",
+        "    fig = fig or plt.gcf()",
+        "    p = os.path.join(ARTIFACTS_DIR, name)",
+        "    fig.savefig(p, dpi=dpi, bbox_inches='tight')",
+        "    print(f'[artifact] image:{name}')",
+        "    return p",
+    ]
 
-    out, err = io.StringIO(), io.StringIO()
-    ok = True
-    start = time.time()
+    # inject df if present
+    if df is not None:
+        try:
+            df_json_str = df.to_json(orient="records")
+            prelude_lines += [
+                f"DF_JSON = r'''{df_json_str}'''",
+                "df = pd.read_json(DF_JSON, orient='records')",
+            ]
+        except Exception as e:
+            st.warning(f"Failed to serialize df for sandbox: {e}")
 
+    prelude_code = "\n".join(prelude_lines)
+
+    wrapped_user_code = f"""
+# --- prelude ---
+{prelude_code}
+
+# --- user code ---
+{code}
+"""
+
+    # ---------- run in sandbox ----------
+    ok, logs, error, artifacts, start = True, "", "", [], time.time()
+    sbx = Sandbox.create()
     try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            # NOTE: This still runs in-process; true timeouts require multiprocessing.
-            exec(safe_code, g, l)
-            fig = l.get("fig", None)
-            if fig is not None:
-                st.pyplot(fig, clear_figure=True)
-    except Exception:
-        ok = False
-        traceback.print_exc(file=err)
+        execution = sbx.run_code(wrapped_user_code, timeout=timeout_s)
+        logs = getattr(execution, "logs", "") or ""
+        err = getattr(execution, "error", "") or getattr(execution, "traceback", "")
+        if err:
+            ok = False
+            error = str(err)
 
-    elapsed = time.time() - start
-    if elapsed > timeout_s:
-        # We cannot kill the code post-fact; warn loudly.
-        ok = False
-        err.write(f"\nTimeout: execution took {elapsed:.2f}s > {timeout_s}s\n")
+        # pull artifacts back
+        try:
+            entries = sbx.files.list("/artifacts")  # [{'path': '/artifacts/..', 'type': 'file', ...}, ...]
+        except Exception:
+            entries = []
 
-    return {"ok": ok, "stdout": out.getvalue(), "stderr": err.getvalue()}
+        for ent in entries or []:
+            if ent.get("type") != "file":
+                continue
+            path = ent.get("path")
+            try:
+                content = sbx.files.read(path)  # bytes
+                mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+                artifacts.append({"path": path, "bytes": content, "mime": mime})
+            except Exception:
+                # ignore unreadable entries
+                pass
+    except Exception as e:
+        ok, error = False, f"{type(e).__name__}: {e}"
+    finally:
+        elapsed = time.time() - start
+        if elapsed > timeout_s:
+            ok = False
+            error = (error + "\n" if error else "") + f"Timeout: execution took {elapsed:.2f}s > {timeout_s}s"
+        try:
+            sbx.close()
+        except Exception:
+            pass
 
+    return {"ok": ok, "logs": logs, "error": error, "elapsed": elapsed, "artifacts": artifacts}
 
 ST_EXEC_TOOL = {
     "type": "function",
@@ -95,9 +179,10 @@ ST_EXEC_TOOL = {
                 "code": {"type": "string", "description": "Python code that calls st.* or produces a fig"},
                 "timeout_s": {"type": "integer", "default": 5},
                 "dataframe_json": {"type": "string", "description": "Optional: records-oriented JSON for df (small payloads only)"},
-                "df_key": {"type": "string", "description": "Optional: key for a dataset stored in st.session_state['datasets']"}
+                "df_key": {"type": "string", "description": "Optional: key for a dataset stored in st.session_state['datasets']"},
+                "e2b_api_key": {"type": "string", "description": "E2B API key to access E2B services"},
             },
-            "required": ["code"]
+            "required": ["code", "e2b_api_key"]
         }
     }
 }
