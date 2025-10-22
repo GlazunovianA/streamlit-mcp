@@ -44,6 +44,7 @@ WORKDIR /app
 COPY requirements.txt ./
 COPY app.py ./
 COPY toolbox.py ./
+COPY chart_renderer.py ./
 COPY .streamlit ./.streamlit
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \

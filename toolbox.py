@@ -1,57 +1,59 @@
-import os, io, time, mimetypes, sys, textwrap, contextlib, traceback, time, json, re
-import streamlit as st
+import os, io, time, mimetypes, re
+import json as _json
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import plotly.express as px
 from dotenv import load_dotenv
 from e2b_code_interpreter import Sandbox
+import base64, binascii
 
-INLINE_JSON_MAX_BYTES = 1_500_000  # ~1.5MB cap for dataframe_json
-
-def _strip_imports(src: str) -> str:
-    # Remove lines like "import x", "from x import y" (avoid ImportError since __import__ is blocked)
-    lines = src.splitlines()
-    cleaned = [ln for ln in lines if not re.match(r'^\s*(import\s+|from\s+\S+\s+import\s+)', ln)]
-    return "\n".join(cleaned)
+INLINE_JSON_MAX_BYTES = 2_000_000  # ~2MB
 
 def handle_st_exec(args: dict):
-    code = args.get("code", "")
+    import streamlit as st
+    """
+    Execute Python in an e2b sandbox, collect artifacts saved under /artifacts,
+    render them in Streamlit, and return a JSON-safe summary (no bytes).
+
+    Args:
+      - code: str (required)                   # user code to run in sandbox
+      - timeout_s: int (default 5)
+      - dataframe_json / df_key / last_df_json: optional DataFrame to inject as `df`
+      - e2b_api_key: str (optional; takes precedence over env/secrets)
+
+    Returns (JSON-safe):
+      {
+        "ok": bool,
+        "logs": str,
+        "error": str,
+        "elapsed": float,
+        "artifacts": [{"path": str, "mime": str, "size": int}]
+      }
+    """
     load_dotenv()
-    os.environ["E2B_API_KEY"] = args.get("e2b_api_key").replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
-    # -------------- sanity check --------------
-    key = args.get("e2b_api_key") or os.getenv("E2B_API_KEY") or st.secrets.get("E2B_API_KEY")
+
+    key = st.secrets.get("e2b", {}).get("e2b_api_key")
+    
+    key = key.replace("\r", "").replace("\n", "").strip().strip('"').strip("'")
+
     if not key:
-        return {"ok": False, "logs": "", "error": "Missing E2B_API_KEY", "elapsed": 0.0}
+        st.error("Missing E2B_API_KEY. Add to .streamlit/secrets.toml or env.")
+        return {"ok": False, "logs": "", "error": "Missing E2B_API_KEY", "elapsed": 0.0, "artifacts": []}
 
-    INLINE_JSON_MAX_BYTES = 2_000_000  # ~2MB
-    sbx = Sandbox.create() # By default the sandbox is alive for 5 minutes
-    # ----------- TEST SANDBOX -----------
-    execution = sbx.run_code("print('hello world')") # Execute Python inside the sandbox
-    print(execution.logs)
+    os.environ["E2B_API_KEY"] = key
 
-    execution = sbx.run_code(code)
-    print(execution.logs)
-    # ------------------------------------
+    # ---------------------------
+    # Optional: resolve a DataFrame for injection as `df`
+    # ---------------------------
+    def _json_to_df(j: str):
+        return pd.read_json(io.StringIO(j), orient="records")
 
-
-    files = sbx.files.list("/")
-    print(files)
-    print('------------- execution successful! ------------')
-    timeout_s = int(args.get("timeout_s", 5))
-
-    # --- Prepare df from (1) dataframe_json -> (2) df_key -> (3) last_df_json
     df = None
-
-    dataframe_json = args.get("dataframe_json")
-    if dataframe_json:
+    j = args.get("dataframe_json")
+    if j:
         try:
-            # size guard
-            if isinstance(dataframe_json, str) and len(dataframe_json.encode("utf-8")) > INLINE_JSON_MAX_BYTES:
+            if isinstance(j, str) and len(j.encode("utf-8")) > INLINE_JSON_MAX_BYTES:
                 raise ValueError("dataframe_json too large; pass df_key instead.")
-            df = pd.read_json(io.StringIO(dataframe_json), orient="records")
+            df = _json_to_df(j)
         except Exception as e:
-            df = None
             st.warning(f"Failed to parse dataframe_json: {e}")
 
     if df is None and args.get("df_key"):
@@ -59,7 +61,7 @@ def handle_st_exec(args: dict):
         j = datasets.get(args["df_key"])
         if j:
             try:
-                df = pd.read_json(io.StringIO(j), orient="records")
+                df = _json_to_df(j)
             except Exception as e:
                 st.warning(f"Failed to load df from df_key={args['df_key']}: {e}")
 
@@ -67,45 +69,123 @@ def handle_st_exec(args: dict):
         j = st.session_state.get("last_df_json")
         if j:
             try:
-                df = pd.read_json(io.StringIO(j), orient="records")
+                df = _json_to_df(j)
             except Exception as e:
                 st.warning(f"Failed to load df from last_df_json: {e}")
 
-
+    # ---------------------------
+    # Prelude that defines Chart.js visualization helpers for the sandbox
+    # ---------------------------
     prelude_lines = [
-        "import os, json, pandas as pd",
-        "from pathlib import Path",
-        "ARTIFACTS_DIR = '/artifacts'",
-        "Path(ARTIFACTS_DIR).mkdir(parents=True, exist_ok=True)",
-        "",
-        "def save_text(text, name='output.txt'):",
-        "    p = os.path.join(ARTIFACTS_DIR, name)",
-        "    with open(p, 'w', encoding='utf-8') as f: f.write(text)",
-        "    print(f'[artifact] text:{name}')",
-        "    return p",
-        "",
-        "def save_table(df, name='table.csv'):",
-        "    p = os.path.join(ARTIFACTS_DIR, name)",
-        "    df.to_csv(p, index=False)",
-        "    print(f'[artifact] table:{name}')",
-        "    return p",
-        "",
-        "def save_json(obj, name='data.json'):",
-        "    p = os.path.join(ARTIFACTS_DIR, name)",
-        "    with open(p, 'w', encoding='utf-8') as f: json.dump(obj, f, ensure_ascii=False)",
-        "    print(f'[artifact] json:{name}')",
-        "    return p",
-        "",
-        "def save_fig(fig=None, name='figure.png', dpi=150):",
-        "    import matplotlib.pyplot as plt",
-        "    fig = fig or plt.gcf()",
-        "    p = os.path.join(ARTIFACTS_DIR, name)",
-        "    fig.savefig(p, dpi=dpi, bbox_inches='tight')",
-        "    print(f'[artifact] image:{name}')",
-        "    return p",
+    "import os, sys, pandas as pd, types",
+    "import json",
+    "",
+    "def create_chartjs_spec(type='bar', data=None, options=None):",
+    "    '''Create and output a Chart.js specification'''",
+    "    spec = {",
+    "        'type': type,",
+    "        'data': data or {},",
+    "        'options': options or {}",
+    "    }",
+    "    print('[chartjs]' + json.dumps(spec))",
+    "",
+    "def df_to_datasets(df, x_col, y_cols, labels=None, colors=None):",
+    "    '''Convert DataFrame columns to Chart.js datasets'''",
+    "    if isinstance(y_cols, str):",
+    "        y_cols = [y_cols]",
+    "    if labels is None:",
+    "        labels = y_cols",
+    "    if colors is None:",
+    "        colors = ['rgb(75, 192, 192)'] * len(y_cols)",
+    "    ",
+    "    datasets = []",
+    "    for i, col in enumerate(y_cols):",
+    "        dataset = {",
+    "            'label': labels[i] if i < len(labels) else col,",
+    "            'data': df[col].tolist(),",
+    "            'backgroundColor': colors[i] if i < len(colors) else 'rgb(75, 192, 192)',",
+    "            'borderColor': colors[i] if i < len(colors) else 'rgb(75, 192, 192)',",
+    "            'borderWidth': 1",
+    "        }",
+    "        datasets.append(dataset)",
+    "    ",
+    "    return {",
+    "        'labels': df[x_col].tolist(),",
+    "        'datasets': datasets",
+    "    }",
+    "",
+    "def plot_line(df, x, y, title=None):",
+    "    '''Create a line chart from DataFrame columns'''",
+    "    data = df_to_datasets(df, x, y)",
+    "    create_chartjs_spec('line', data, {'title': title} if title else None)",
+    "",
+    "def plot_bar(df, x, y, title=None):",
+    "    '''Create a bar chart from DataFrame columns'''",
+    "    data = df_to_datasets(df, x, y)",
+    "    create_chartjs_spec('bar', data, {'title': title} if title else None)",
+    "",
+    "def plot_scatter(df, x, y, title=None):",
+    "    '''Create a scatter chart from DataFrame columns'''",
+    "    data = df_to_datasets(df, x, y)",
+    "    create_chartjs_spec('scatter', data, {'title': title} if title else None)",
+    "",
+    "# ---- streamlit shim injected as a fake module so `import streamlit as st` works ----",
+    "def _as_dataframe(obj):",
+    "    if isinstance(obj, pd.DataFrame):",
+    "        return obj",
+    "    try:",
+    "        return pd.DataFrame(obj)",
+    "    except Exception:",
+    "        return pd.DataFrame({'value':[obj]})",
+    "",
+    "class _ShimST:",
+    "    def write(self, x):",
+    "        save_text(str(x), name='stdout.txt')",
+    "    def markdown(self, x):",
+    "        save_text(str(x), name='markdown.md')",
+    "    def code(self, x):",
+    "        save_text(str(x), name='code.txt')",
+    "    def dataframe(self, data):",
+    "        df = _as_dataframe(data)",
+    "        save_table(df, name='dataframe.csv')",
+    "    def pyplot(self, fig=None):",
+    "        save_fig(fig=fig, name='plot.png')",
+    "    def _plot_df(self, data, kind, name):",
+    "        import matplotlib.pyplot as plt",
+    "        df = _as_dataframe(data)",
+    "        # try to use the first non-index column if needed",
+    "        try:",
+    "            if kind == 'bar':",
+    "                ax = df.plot(kind='bar')",
+    "            elif kind == 'line':",
+    "                ax = df.plot(kind='line')",
+    "            elif kind == 'scatter':",
+    "                # scatter needs x/y; pick first two columns if available",
+    "                cols = list(df.columns)",
+    "                if len(cols) >= 2:",
+    "                    ax = df.plot(kind='scatter', x=cols[0], y=cols[1])",
+    "                else:",
+    "                    ax = df.plot(kind='line')",
+    "            else:",
+    "                ax = df.plot(kind='line')",
+    "            fig = ax.get_figure()",
+    "            save_fig(fig=fig, name=name)",
+    "            plt.close(fig)",
+    "        except Exception as _e:",
+    "            save_text(f'Plot error: {type(_e).__name__}: {_e}', name='plot_error.txt')",
+    "    def bar_chart(self, data):",
+    "        self._plot_df(data, kind='bar', name='bar_chart.png')",
+    "    def line_chart(self, data):",
+    "        self._plot_df(data, kind='line', name='line_chart.png')",
+    "    def scatter_chart(self, data):",
+    "        self._plot_df(data, kind='scatter', name='scatter_chart.png')",
+    "",
+    "# create module-like object and register under sys.modules",
+    "_st_mod = types.SimpleNamespace(**{k:getattr(_ShimST(), k) for k in dir(_ShimST) if not k.startswith('_')})",
+    "sys.modules['streamlit'] = _st_mod",
     ]
 
-    # inject df if present
+
     if df is not None:
         try:
             df_json_str = df.to_json(orient="records")
@@ -118,71 +198,227 @@ def handle_st_exec(args: dict):
 
     prelude_code = "\n".join(prelude_lines)
 
+    # ---------------------------
+    # Wrap user code
+    # ---------------------------
+    user_code = args.get("code", "") or ""
+    timeout_s = int(args.get("timeout_s", 5))
+
     wrapped_user_code = f"""
 # --- prelude ---
 {prelude_code}
 
 # --- user code ---
-{code}
+{user_code}
 """
 
-    # ---------- run in sandbox ----------
-    ok, logs, error, artifacts, start = True, "", "", [], time.time()
+    # ---------------------------
+    # Execute in sandbox (single sandbox)
+    # ---------------------------
+    ok, logs, error, artifacts_meta = True, "", "", []
+    start = time.time()
     sbx = Sandbox.create()
     try:
         execution = sbx.run_code(wrapped_user_code, timeout=timeout_s)
-        logs = getattr(execution, "logs", "") or ""
+
+        # Coerce logs to string (avoid "Logs is not JSON serializable")
+        raw_logs = getattr(execution, "logs", "")
+        if isinstance(raw_logs, str):
+            logs = raw_logs
+        elif isinstance(raw_logs, list):
+            logs = ''.join(str(line) for line in raw_logs)
+        else:
+            logs = getattr(raw_logs, "text", None) or getattr(raw_logs, "stdout", None) or str(raw_logs)
+        logs = str(logs).strip()
+
+        # Chart.js specs will be handled by chart_renderer.py
+            
         err = getattr(execution, "error", "") or getattr(execution, "traceback", "")
         if err:
             ok = False
             error = str(err)
 
-        # pull artifacts back
+        # Pull and render artifacts
         try:
-            entries = sbx.files.list("/artifacts")  # [{'path': '/artifacts/..', 'type': 'file', ...}, ...]
+            entries = sbx.files.list("/artifacts")
         except Exception:
             entries = []
 
-        for ent in entries or []:
-            if ent.get("type") != "file":
-                continue
-            path = ent.get("path")
+
+        def _get(ent, attr, default=None):
+            # support both dict and object entries
+            if isinstance(ent, dict):
+                return ent.get(attr, default)
+            return getattr(ent, attr, default)
+
+
+        def _maybe_b64(s: str) -> bool:
+            s2 = s.strip()
+            if len(s2) % 4 != 0:
+                return False
+            return re.fullmatch(r'[A-Za-z0-9+/=\s]+', s2) is not None
+
+        def _read_bytes(sbx, path):
+            """Normalize sbx.files.read() into raw bytes (handles bytes/str/dict/base64)."""
             try:
-                content = sbx.files.read(path)  # bytes
-                mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-                artifacts.append({"path": path, "bytes": content, "mime": mime})
-            except Exception:
-                # ignore unreadable entries
-                pass
+                # First try the new e2b API for getting files
+                if hasattr(sbx, 'filesystem'):
+                    content = sbx.filesystem.read(path)
+                    if isinstance(content, (bytes, bytearray)):
+                        return bytes(content)
+                    elif isinstance(content, str):
+                        return content.encode('utf-8')
+                
+                # Fallback to old API
+                obj = sbx.files.read(path)
+
+                # 1) already bytes
+                if isinstance(obj, (bytes, bytearray)):
+                    return bytes(obj)
+
+                # 2) plain string: try base64; if not base64, try latin-1 to preserve bytes
+                if isinstance(obj, str):
+                    s = obj
+                    if _maybe_b64(s):
+                        try:
+                            return base64.b64decode(s, validate=True)
+                        except binascii.Error:
+                            pass
+                    # latin-1 roundtrip preserves codepoints 0..255 without inserting U+FFFD
+                    return s.encode("latin-1", errors="replace")
+
+                # 3) dict-like payloads some SDKs return
+                if isinstance(obj, dict):
+                    enc = obj.get("encoding")
+                    data = obj.get("content") or obj.get("data") or obj.get("bytes")
+                    if data is None:
+                        return None
+                    if isinstance(data, (bytes, bytearray)):
+                        return bytes(data)
+                    if isinstance(data, str):
+                        if enc == "base64" or _maybe_b64(data):
+                            try:
+                                return base64.b64decode(data, validate=True)
+                            except binascii.Error:
+                                return data.encode("latin-1", errors="replace")
+                        return data.encode("latin-1", errors="replace")
+
+                return None
+            except Exception as e:
+                st.error(f"Error reading file {path}: {str(e)}")
+                return None
+
+                # (visualization handling moved to earlier in the code)
+
     except Exception as e:
-        ok, error = False, f"{type(e).__name__}: {e}"
+        ok = False
+        error = f"{type(e).__name__}: {e}"
+        st.error(error)
     finally:
         elapsed = time.time() - start
         if elapsed > timeout_s:
             ok = False
-            error = (error + "\n" if error else "") + f"Timeout: execution took {elapsed:.2f}s > {timeout_s}s"
+            timeout_msg = f"Timeout: execution took {elapsed:.2f}s > {timeout_s}s"
+            error = (error + "\n" if error else "") + timeout_msg
+            st.warning(timeout_msg)
         try:
             sbx.close()
         except Exception:
             pass
 
-    return {"ok": ok, "logs": logs, "error": error, "elapsed": elapsed, "artifacts": artifacts}
+    # Return JSON-safe summary (no bytes)
+    return {
+        "ok": bool(ok),
+        "logs": str(logs)[:20000],
+        "error": str(error) if error else "",
+        "elapsed": float(elapsed),
+        "artifacts": artifacts_meta,
+    }
 
 ST_EXEC_TOOL = {
     "type": "function",
     "function": {
         "name": "st_exec",
-        "description": "Execute short Python to render charts/tables in Streamlit. Use st.* APIs; may also use matplotlib.pyplot as plt or plotly.express as px.",
+        "description": "Create Chart.js visualizations. Helper functions available: create_chartjs_spec() and df_to_datasets()",
         "parameters": {
             "type": "object",
             "properties": {
-                "code": {"type": "string", "description": "Python code that calls st.* or produces a fig"},
-                "timeout_s": {"type": "integer", "default": 5},
-                "dataframe_json": {"type": "string", "description": "Optional: records-oriented JSON for df (small payloads only)"},
-                "df_key": {"type": "string", "description": "Optional: key for a dataset stored in st.session_state['datasets']"},
-                "e2b_api_key": {"type": "string", "description": "E2B API key to access E2B services"},
+                "code": {
+                    "type": "string",
+                    "description": """Python code to create Chart.js visualizations.  Example usage:
+                        import pandas as pd
+                        import numpy as np
+                        import json
+                        def plot_line(df, x_col, y_cols, title=None):
+                            data = df_to_datasets(df, x_col, y_cols)
+                            options = {'title': {'text': title}} if title else {}
+                            create_chartjs_spec('line', data, options)
+
+                        def plot_bar(df, x_col, y_col, title=None):
+                            data = df_to_datasets(df, x_col, y_col)
+                            options = {'title': {'text': title}} if title else {}
+                            create_chartjs_spec('bar', data, options)
+
+                        def plot_scatter(df, x_col, y_col, title=None):
+                            data = {
+                                'labels': df[x_col].tolist(),
+                                'datasets': [{
+                                    'label': y_col,
+                                    'data': df[y_col].tolist(),
+                                    'backgroundColor': 'rgb(75, 192, 192)',
+                                    'borderColor': 'rgb(75, 192, 192)',
+                                    'borderWidth': 1
+                                }]
+                            }
+                            options = {'title': {'text': title}} if title else {}
+                            create_chartjs_spec('scatter', data, options)
+
+                        # Create sample data
+                        df = pd.DataFrame({
+                            'x': range(5),
+                            'y1': [1, 2, 3, 2, 1],
+                            'y2': [2, 1, 2, 3, 2],
+                            'y3': [1, 3, 5, 3, 1]
+                        })
+
+                        # Test line chart with multiple series
+                        plot_line(df, 'x', ['y1', 'y2'], title='Multi-Series Line Chart')
+
+                        # Test bar chart
+                        plot_bar(df, 'x', 'y3', title='Simple Bar Chart')
+
+                        # Test scatter plot
+                        scatter_data = pd.DataFrame({
+                            'x': np.random.rand(10),
+                            'y': np.random.rand(10)
+                        })
+                        plot_scatter(scatter_data, 'x', 'y', title='Scatter Plot')
+                    """,    
+                    
+                }
             },
-            "required": ["code", "e2b_api_key"]
+            "required": ["code"]
+        }
+    }
+}
+
+
+DECISION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "decision_record",
+        "description": "Record a compact plan before acting. No user-visible output.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "need_db": {"type": "boolean"},
+                "goal":    {"type": "string"},
+                "sql":     {"type": "string"},
+                "viz":     {"type": "boolean"},
+                "next_tool": {"type": "string", "enum":["query","st_exec"]},
+                "next_args": {"type": "object"},
+            },
+            "required": ["need_db", "goal", "viz"]
         }
     }
 }

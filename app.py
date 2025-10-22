@@ -13,207 +13,8 @@ from openai import AzureOpenAI
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# ------------------ test langgraph ------------------
-
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, SystemMessage
-from typing import TypedDict, Optional, List, Dict, Any
-
-
-
-MAX_RETRIES = 1
-
-class AgentState(TypedDict, total=False):
-    user_msg: str               # ← set once at entry only
-    plan: Dict[str, Any]
-    sql: Optional[str]
-    tables: List[str]
-    viz_code: Optional[str]
-    df_json: Optional[str]
-    answer: Optional[str]
-    error: Optional[str]
-    retry_count: int
-
-def build_langgraph(client, deployment, session):
-    g = StateGraph(AgentState)
-
-    async def planner_node(state: AgentState):
-        user_msg = state["user_msg"]  # READ ONLY
-        sys = (
-            SYS_PROMPT
-            + "\nReturn ONLY a compact JSON object with keys: "
-              "need_db (bool), sql (string or null), tables (array of strings), "
-              "viz_code (string or null). No extra text."
-        )
-        resp = client.chat.completions.create(
-            model=deployment,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.0,
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        plan: Dict[str, Any] = {}
-        try:
-            if raw.startswith("```"):
-                raw = raw.strip("`")
-                raw = raw.split("\n", 1)[-1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            if "{" in raw and "}" in raw:
-                raw = raw[raw.index("{"): raw.rindex("}")+1]
-            plan = json.loads(raw)
-        except Exception:
-            plan = {}
-
-        return {
-            "plan": plan,
-            "sql": plan.get("sql"),
-            "viz_code": plan.get("viz_code"),
-            "tables": plan.get("tables") or [],
-            "retry_count": state.get("retry_count", 0),
-        }
-
-    g.add_node("planner", planner_node)
-
-    def need_db_router(state: AgentState):
-        return "introspect" if bool(state.get("plan", {}).get("need_db", True)) else "summarize"
-    g.add_conditional_edges("planner", need_db_router, {"introspect": "introspect", "summarize": "summarize"})
-
-    async def introspect_node(state: AgentState):
-        tables = state.get("tables") or []
-
-        # light table guess from SQL if none provided
-        sql_lower = (state.get("sql") or "").lower()
-        if not tables and " from " in sql_lower:
-            try:
-                after_from = sql_lower.split(" from ", 1)[1]
-                first = after_from.split()[0].strip(",;")
-                if first:
-                    tables = [first.replace('"', '').replace("'", "")]
-            except Exception:
-                pass
-
-        missing: List[str] = []
-        for t in tables:
-            schema_table = t if "." in t else f"public.{t}"
-            try:
-                res = await session.call_tool("query", {
-                    "sql": f"SELECT to_regclass('{schema_table}') IS NOT NULL AS exists;"
-                })
-                exists = "true" in str(res.content).lower() or "t" in str(res.content).lower()
-                if not exists:
-                    missing.append(t)
-            except Exception as e:
-                return {"error": f"Introspection error for {t}: {e}"}
-
-        plan = dict(state.get("plan", {}))
-        plan["_introspect_missing"] = missing
-        delta: AgentState = {"plan": plan}
-        if missing:
-            delta["error"] = f"Missing tables: {', '.join(missing)}"
-        return delta
-
-    g.add_node("introspect", introspect_node)
-
-    def introspect_router(state: AgentState):
-        return "error" if state.get("error") else "query"
-    g.add_conditional_edges("introspect", introspect_router, {"error": "error", "query": "query"})
-
-    async def query_node(state: AgentState):
-        sql = state.get("sql")
-        if not sql:
-            return {"error": "Planner did not provide SQL."}
-
-        # add LIMIT if missing
-        if " limit " not in sql.lower():
-            sql = sql.rstrip(" ;") + " LIMIT 100;"
-
-        try:
-            res = await session.call_tool("query", {"sql": sql})
-            preview = str(res.content)
-            return {"sql": sql, "df_json": preview}
-        except Exception as e:
-            return {"sql": sql, "error": f"Query failed: {e}"}
-
-    g.add_node("query", query_node)
-
-    def query_router(state: AgentState):
-        if state.get("error"):
-            return "error"
-        return "visualize" if state.get("viz_code") else "summarize"
-    g.add_conditional_edges("query", query_router, {"error": "error", "visualize": "visualize", "summarize": "summarize"})
-
-    async def visualize_node(state: AgentState):
-        code = state.get("viz_code")
-        if not code:
-            return {}
-        try:
-            handle_st_exec({"code": code, "dataframe_json": state.get("df_json")})
-            return {"answer": "Rendered a visualization from the latest query."}
-        except Exception as e:
-            return {"error": f"Visualization error: {e}"}
-
-    g.add_node("visualize", visualize_node)
-
-    def viz_router(state: AgentState):
-        return "error" if state.get("error") else "summarize"
-    g.add_conditional_edges("visualize", viz_router, {"error": "error", "summarize": "summarize"})
-
-    async def summarize_node(state: AgentState):
-        if state.get("error"):
-            return {"answer": state["error"]}
-
-        # brief wrap-up
-        msgs = [
-            {"role": "system", "content": "Be concise and factual."},
-            {"role": "user", "content": (
-                "Provide a short summary of the result or the visualization that was produced. "
-                "Do not include raw SQL or JSON."
-            )},
-        ]
-        resp = client.chat.completions.create(model=deployment, messages=msgs, temperature=0.0)
-        return {"answer": resp.choices[0].message.content}
-
-    g.add_node("summarize", summarize_node)
-    g.add_edge("summarize", END)
-
-    # ── ERROR NODE ─────────────────────────────
-    async def error_node(state: AgentState):
-        # bump retry counter here
-        retry = int(state.get("retry_count", 0)) + 1
-        # Optional: clear the error so we don’t loop forever on same message
-        return {"retry_count": retry, "error": state.get("error")}  # keep error text for summarize if needed
-
-    g.add_node("error", error_node)
-
-    def error_router(state: AgentState):
-        retry = int(state.get("retry_count", 0))
-        if retry <= MAX_RETRIES:
-            return "planner"     # re-plan after error
-        return "summarize"       # give up → explain error
-    g.add_conditional_edges("error", error_router, {"planner": "planner", "summarize": "summarize"})
-
-    g.set_entry_point("planner")
-    return g.compile()
-
-
-
-async def chat_turn_langgraph():
-    user_msg = st.session_state.messages[-1]["content"]
-    async with mcp_session() as session:
-        graph = build_langgraph(client, deployment, session)
-        state = {"user_msg": user_msg}
-        result = await graph.ainvoke(state)
-        answer = result.get("answer", "")
-        return answer
-
-
-# ------------------ test langgraph end ------------------
-
-
 from toolbox import ST_EXEC_TOOL, handle_st_exec
+from toolbox import DECISION_TOOL
 # ----------------------------
 # Streamlit page setup
 # ----------------------------
@@ -239,7 +40,7 @@ with st.sidebar:
     azure_api_key = st.secrets.get("azure", {}).get("api_key") or os.getenv("AZURE_OPENAI_KEY")
     if not azure_api_key:
         st.warning("No Azure API key found. Add to `st.secrets['azure']['api_key']`.", icon="⚠️")
-
+    
     e2b_api_key = st.secrets.get("e2b", {}).get("e2b_api_key") or os.getenv("E2B_API_KEY")
     if not e2b_api_key:
         st.warning("No E2B API key found. Add to `st.secrets['e2b']['e2b_api_key']`.", icon="⚠️")
@@ -275,6 +76,12 @@ TOOL-FIRST POLICY
 - Never print raw SQL or JSON in your assistant message. Use tools. Summarize results in natural language only.
 - Do not claim to have used a tool unless a tool call exists in this turn.
 
+TOOL CALLING RULES (hard)
+- If you decide to use a tool, your assistant message MUST have empty `content` and include a tool call object. Do NOT describe the call in text.
+- Never print pseudo-calls like “[query] …”, “{ function: … }”, or raw SQL/JSON in the chat.
+- Do not say you used a tool unless there is a tool call in THIS turn.
+- If a tool is relevant, call it FIRST. Do not write a final answer before tool results arrive.
+
 DECISION RECORD
 Before answering, output exactly one line labeled DECISION containing a compact JSON object:
 DECISION {"need_db": true|false, "goal": "<very short>", "sql": "<planned or empty>", "viz": true|false}
@@ -301,16 +108,39 @@ QUERY HYGIENE
 - If no rows are returned, say so and suggest adjustments rather than guessing new tables.
 
 VISUALIZATION
-- If a chart helps, set "viz": true in DECISION, then call st_exec with concise code using st.line_chart / st.bar_chart / st.scatter_chart or matplotlib/plotly.
-- Assume df exists from the last query; otherwise pass dataframe_json.
+- If a chart helps, set "viz": true in DECISION, then use tool `st_exec` to produce a Chart.js specification via the sandbox helpers.
+- Use the sandbox helpers `df_to_datasets(df, x_col, y_cols, ...)` and `create_chartjs_spec(type, data, options)` to emit a standardized Chart.js spec.
+- The sandbox must print the spec prefixed with the marker `[chartjs]` so the host app can detect and render it.
+- The DataFrame from your last query is available as `df`. Prefer creating a small, well-labeled spec and avoid huge payloads.
+- Example: single-series line chart
+    ```python
+    data = df_to_datasets(df, x_col='date', y_cols='value', labels='Revenue')
+    create_chartjs_spec('line', data, {
+            'responsive': True,
+            'plugins': {'title': {'display': True, 'text': 'Revenue Over Time'}}
+    })
+    ```
+
+- Example: multi-series bar chart
+    ```python
+    data = df_to_datasets(df, x_col='category', y_cols=['sales','profit'], labels=['Sales','Profit'])
+    create_chartjs_spec('bar', data, {'plugins': {'title': {'display': True, 'text': 'Sales vs Profit'}}})
+    ```
+
+- Guidelines:
+    - Keep default LIMITs (e.g., LIMIT 100) to avoid large payloads.
+    - Use concise labels and numeric types for dataset values.
+    - If a chart would be too large or sensitive, ask a clarifying question instead of returning a spec.
 
 ERRORS & RETRIES
 - On SQL error: fix and retry once. If it still fails, report the error briefly and ask how to proceed.
 - On permission or connectivity errors: report and stop.
 - On ambiguous requests: ask a clarifying question before querying.
+- If the user asks to confirm, re-run the relevant tool instead of relying on previous results.
 
 TRUTHFULNESS
 - If the required table or column does not exist (per to_regclass/INFORMATION_SCHEMA), say so plainly.
+
 
 EXAMPLES
 User: “Show the top 10 customers by revenue.”
@@ -323,16 +153,25 @@ DECISION {"need_db": true, "goal": "Find top customers by revenue", "sql": "", "
         ORDER BY revenue DESC
         LIMIT 10;
 [st_exec]  # code that bar_charts df[['customer_id','revenue']]
-Assistant: Here are the top 10 customers by revenue. Want to drill into a specific customer?
+Assistant: 
+Here are the top 10 customers by revenue. Want to drill into a specific customer?
 
 User: “Get rows from table foo.”
 Assistant:
 DECISION {"need_db": true, "goal": "Verify table then sample", "sql": "", "viz": false}
 [query] SELECT to_regclass('public.foo') IS NOT NULL AS exists;
-Assistant: The table `foo` does not exist. Here are available tables: …
+Assistant: 
+The table `foo` does not exist. Here are available tables: …
+
+User: “Get rows from table foo.”
+Assistant:
+DECISION {"need_db": true, "goal": "Verify table then sample", "sql": "", "viz": false}
+[query] SELECT to_regclass('public.foo') IS NOT NULL AS exists;
+Assistant: 
+The table `foo` does not exist. Here are available tables: …
 """
 )
- 
+
 def init_chat():
     if "messages" not in st.session_state:
         st.session_state.messages = [{"role": "system", "content": SYS_PROMPT}]
@@ -464,14 +303,29 @@ async def get_openai_tools(session: ClientSession):
         })
 
     # keep your custom exec tool
-    openai_tools.append(ST_EXEC_TOOL)
+    openai_tools.extend((ST_EXEC_TOOL, DECISION_TOOL))
 
     log(f"🧰 Tools available: {[t['function']['name'] for t in openai_tools]}")
     # also log full function schemas to help debugging
     logger.debug(f"OpenAI function defs: {openai_tools}")
     return openai_tools
 
+# =========================
+# Utilities for force tool use
+# =========================
+def needs_tool(user_text: str) -> bool:
+    if not user_text:
+        return False
+    # Heuristic: DB-related queries should trigger tools
+    k = ("select ", " from ", "table", "schema", "row", "count", "top", "average", "avg", "plot", "chart")
+    t = user_text.lower()
+    return any(s in t for s in k)
 
+def looks_like_pseudo_call(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    return ("[query]" in t) or ("DECISION {" in t) or t.startswith("SELECT ") or ('{"sql":' in t)
 # =========================
 # One chat turn with tools
 # =========================
@@ -488,13 +342,19 @@ async def chat_turn():
         openai_tools = await get_openai_tools(session)
         tool_choice = "auto" if openai_tools else "none"
 
+        preferred_choice = {"type": "function", "function": {"name": "decision_record"}}
         # First call
         response = client.chat.completions.create(
             model=deployment,
             messages=runtime_messages,
             tools=openai_tools,
-            tool_choice=tool_choice,
+            tool_choice=preferred_choice,  # nudge: plan first
+            parallel_tool_calls=True,
         )
+
+        msg = response.choices[0].message
+
+
 
         # Tool loop
         while getattr(response.choices[0].message, "tool_calls", None):
@@ -535,10 +395,37 @@ async def chat_turn():
                 fname_norm = alias.get(fname, fname)
 
                 log(f"🔧 {fname} → {fname_norm} | 📝 {fargs}")
-
+                force_next = None
+                force_args = None
+                if fname_norm == "decision_record":
+                    # no-op: log/ack; don't show to user
+                    log(f"🧭 decision_record: {fargs}")
+                    runtime_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": "decision_record",
+                        "content": json.dumps({"ok": True})
+                    })
+                    if isinstance(fargs, dict):
+                        if fargs.get("next_tool") in ("query","st_exec"):
+                            force_next = fargs["next_tool"]
+                            if isinstance(fargs.get("next_args"), dict):
+                                force_args = fargs["next_args"]
+                        else:
+                            # fallback heuristics from the plan
+                            if fargs.get("need_db"):
+                                force_next = "query"
+                                if fargs.get("sql"):
+                                    force_args = {"sql": fargs["sql"]}
+                            elif fargs.get("viz"):
+                                force_next = "st_exec"
+                    continue
                 if fname_norm == "st_exec":
                     try:
                         result = handle_st_exec(fargs)              # renders directly in Streamlit
+                        if result["ok"] and "[chartjs]" in result["logs"]:
+                            from chart_renderer import render_chart_spec
+                            render_chart_spec(result["logs"])
                         runtime_messages.append({
                             "role": "tool",
                             "tool_call_id": tc.id,
@@ -557,6 +444,7 @@ async def chat_turn():
                     continue
                 else:
                     try:
+                        # fall back to MCP tool call
                         fname_norm = fname_norm.strip()
                         mcp_res = await session.call_tool(fname_norm, fargs)
                         preview = str(mcp_res.content)
@@ -582,7 +470,7 @@ async def chat_turn():
                         # stable key (timestamp or hash-of-sql)
                         df_key = f"df_{int(time.time())}"
                         st.session_state["datasets"][df_key] = parsed
-                        log(f"📦 Stored dataset key: {df_key}")
+                        log(f"📦 Stored dataset key : {df_key}")
 
                         runtime_messages.append({
                             "role": "tool",
@@ -600,18 +488,31 @@ async def chat_turn():
                             "role": "assistant",    
                             "content": f"Error during tool {fname_norm} execution: {traceback.format_exc()}",
                         })
-                    continue
 
+            tool_choice_next = "auto"
+            if force_next in ("query","st_exec"):
+                tool_choice_next = {"type":"function","function":{"name": force_next}}
+                # (Optional) give the model a gentle hint about args (it often echoes them)
+                if force_args:
+                    runtime_messages.append({
+                        "role":"system",
+                        "content": f"Next tool to call: {force_next} with args: {json.dumps(force_args)}"
+                    })
             # 3) follow-up call
             response = client.chat.completions.create(
                 model=deployment,
                 messages=runtime_messages,
                 tools=openai_tools,
-                tool_choice="auto",
+                tool_choice=tool_choice_next,
+                parallel_tool_calls=True,
             )
 
         # Final assistant response
-        final_text = response.choices[0].message.content or ""
+        def _clean(text: str) -> str:
+            import re
+            return re.sub(r"^DECISION\s*\{.*\}\s*$", "", text or "", flags=re.MULTILINE).strip()
+
+        final_text = _clean(response.choices[0].message.content) or ""
         st.session_state.messages.append({"role": "assistant", "content": final_text})
         log("🎉 Turn complete")
         return final_text
@@ -634,9 +535,17 @@ if prompt := st.chat_input("Give me a good overview of the data you have access 
         st.markdown(prompt)
     with st.chat_message("assistant"):
         with st.spinner("Thinking with tools…"):
-            answer = asyncio.run(chat_turn()) # (chat_turn_langgraph()) --- does not function yet ----
+            answer = asyncio.run(chat_turn()) 
             st.markdown(clean_model_output(answer) if answer.strip() else "_(no text in final reply)_")
 
+if st.button("😡 Urge LLM to use tools"):
+    st.session_state.messages.append({"role": "user", "content": "Please make sure to use the available tools to assist with my request."})
+    with st.chat_message("user"):
+        st.markdown("Please make sure to use the available tools to assist with my request.")
+    with st.chat_message("assistant"):
+        with st.spinner("Encouraging the model to use tools…"):
+            answer = asyncio.run(chat_turn()) 
+            st.markdown(clean_model_output(answer) if answer.strip() else "_(no text in final reply)_")
 
 with st.expander("Developer Console (MCP Logs)"):
     st.code("\n".join(st.session_state.logs) or "No logs yet.")
